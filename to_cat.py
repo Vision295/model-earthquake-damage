@@ -1,7 +1,14 @@
 import pandas as pd
 import numpy as np
 import json
-from optbinning import MulticlassOptimalBinning
+import warnings
+from sklearn.tree import DecisionTreeClassifier
+
+MAX_BINS = 50
+MIN_SAMPLES_LEAF = 100
+
+# Suppress sklearn deprecation warnings
+warnings.filterwarnings('ignore', category=FutureWarning, module='sklearn')
 
 def load_and_merge_data(train_values_path, train_labels_path):
     """Load training data and labels, merge them"""
@@ -10,54 +17,77 @@ def load_and_merge_data(train_values_path, train_labels_path):
     df = df_values.merge(df_labels, on='building_id', how='inner')
     return df
 
-def optbinning_discretization(df, feature_name, prediction_col='damage_grade', 
-                              solver='cp', prebinning_method='cart', 
-                              max_n_prebins=20, verbose=False):
+def decision_tree_binning(df, feature_name, prediction_col='damage_grade', 
+                         max_bins=MAX_BINS, min_samples_leaf=MIN_SAMPLES_LEAF):
     """
-    Apply OptBinning supervised discretization to a numerical feature
+    Use Decision Tree to find optimal split points for binning
+    More robust than optbinning and works for all types of features
     
     Parameters:
     - df: DataFrame with the feature and target
     - feature_name: name of the numerical feature to bin
     - prediction_col: target column name
-    - solver: 'cp' (constraint programming) or 'mip' (mixed integer programming)
-    - prebinning_method: 'cart', 'quantile', or 'uniform'
-    - max_n_prebins: maximum number of pre-bins
+    - max_bins: maximum number of bins (max_depth of tree + 1)
+    - min_samples_leaf: minimum samples per leaf
     
     Returns:
-    - discretized column (categorical)
-    - optbinning object (for later transformation)
+    - split_points: list of split thresholds
     """
-    x = df[feature_name].values
+    x = df[feature_name].values.reshape(-1, 1)
     y = df[prediction_col].values
     
-    # Initialize OptimalBinning for multiclass target
-    optb = MulticlassOptimalBinning(
-        name=feature_name,
-        solver=solver,
-        prebinning_method=prebinning_method,
-        max_n_prebins=max_n_prebins,
-        verbose=verbose
+    # Use Decision Tree to find splits
+    tree = DecisionTreeClassifier(
+        max_leaf_nodes=MAX_BINS,
+        min_samples_leaf=MIN_SAMPLES_LEAF,
+        random_state=42
     )
+    tree.fit(x, y)
     
-    # Fit the binning
-    optb.fit(x, y)
+    # Extract thresholds from the tree
+    thresholds = tree.tree_.threshold[tree.tree_.threshold != -2]  # -2 means leaf node
+    split_points = sorted(np.unique(thresholds))
     
-    # Transform to bins (categorical labels)
-    x_binned = optb.transform(x, metric='bins')
+    return split_points
+
+def apply_binning_to_value(value, splits):
+    """
+    Apply binning to a single value based on split points
     
-    return pd.Series(x_binned, index=df.index).astype('category'), optb
+    Parameters:
+    - value: numerical value to bin
+    - splits: list of split points
+    
+    Returns:
+    - bin_label: string representation of the bin interval
+    """
+    if pd.isna(value):
+        return np.nan
+    
+    if len(splits) == 0:
+        return "all"
+    
+    splits = sorted(splits)
+    
+    # Find which bin the value falls into
+    if value <= splits[0]:
+        return f"(-inf, {splits[0]}]"
+    
+    for i in range(len(splits) - 1):
+        if splits[i] < value <= splits[i + 1]:
+            return f"({splits[i]}, {splits[i + 1]}]"
+    
+    return f"({splits[-1]}, inf)"
 
 def create_binning_pipeline(df, prediction_col='damage_grade',
                            features_to_discretize=None,
-                           solver='cp', 
-                           prebinning_method='cart',
-                           max_n_prebins=20):
+                           max_bins=MAX_BINS,
+                           min_samples_leaf=MIN_SAMPLES_LEAF):
     """
-    Create binning transformers for all numerical features
+    Create binning transformers for all numerical features using Decision Tree
     
     Returns:
-    - binning_pipeline: dict of {feature_name: optbinning_object}
+    - binning_pipeline: dict of {feature_name: split_points}
     - df_transformed: DataFrame with binned features
     """
     if features_to_discretize is None:
@@ -67,66 +97,66 @@ def create_binning_pipeline(df, prediction_col='damage_grade',
             'height_percentage', 
             'geo_level_1_id', 
             'geo_level_2_id', 
-            'geo_level_3_id',
-            'count_florrs_pre_eq',
-            'area_percentage',
-            'count_families'
-      ]
+            'geo_level_3_id'
+        ]
     
     df_transformed = df.copy()
     binning_pipeline = {}
     
     print(f"Creating binning pipeline with {len(features_to_discretize)} features...")
-    print(f"Method: solver={solver}, prebinning={prebinning_method}\n")
+    print(f"Features to discretize: {features_to_discretize}")
+    print(f"Method: Decision Tree (max_bins={max_bins}, min_samples_leaf={min_samples_leaf})\n")
     
     for feature in features_to_discretize:
         if feature not in df.columns:
             print(f"Warning: {feature} not found in DataFrame, skipping...")
             continue
-            
-        print(f"Processing {feature}...")
+        
+        # Check data type and uniqueness
+        n_unique = df[feature].nunique()
+        print(f"Processing {feature} (unique values: {n_unique})...")
         
         try:
-            discretized, optb = optbinning_discretization(
+            # Get split points using decision tree
+            split_points = decision_tree_binning(
                 df, feature, prediction_col, 
-                solver, prebinning_method, max_n_prebins
+                max_bins, min_samples_leaf
             )
             
-            # Store the binning object for later use
-            binning_pipeline[feature] = optb
+            # Store split points
+            binning_pipeline[feature] = split_points
             
-            # Replace column with discretized version
-            df_transformed[feature] = discretized
+            # Apply binning
+            binned_values = df[feature].apply(
+                lambda x: apply_binning_to_value(x, split_points)
+            )
+            df_transformed[feature] = binned_values.astype('category')
             
-            # Get binning information
-            split_points = optb.splits if hasattr(optb, 'splits') else []
-            n_bins = len(optb.splits) + 1 if hasattr(optb, 'splits') else 0
+            n_bins = len(split_points) + 1
             
-            print(f"  ✓ Status: {optb.status}")
             print(f"  ✓ Number of bins: {n_bins}")
             print(f"  ✓ Split points: {split_points}")
+            print()
             
         except Exception as e:
             print(f"  ✗ ERROR: {str(e)}")
             print(f"  Keeping original column for {feature}")
+            print()
     
     print(f"\nBinning pipeline created successfully!")
+    print(f"Total features binned: {len(binning_pipeline)}")
     return binning_pipeline, df_transformed
 
 def save_binning_pipeline(binning_pipeline, filename='binning_pipeline.json'):
     """
     Save binning pipeline to JSON file
-    
-    Note: Saves the split points and metadata, not the full optbinning object
     """
     pipeline_data = {}
     
-    for feature_name, optb in binning_pipeline.items():
+    for feature_name, split_points in binning_pipeline.items():
         pipeline_data[feature_name] = {
-            'splits': optb.splits.tolist() if hasattr(optb.splits, 'tolist') else list(optb.splits),
-            'status': optb.status,
-            'name': optb.name,
-            'dtype': str(optb.dtype) if hasattr(optb, 'dtype') else 'float64'
+            'splits': split_points if isinstance(split_points, list) else split_points.tolist(),
+            'n_bins': len(split_points) + 1
         }
     
     with open(filename, 'w') as f:
@@ -146,32 +176,6 @@ def load_binning_pipeline(filename='binning_pipeline.json'):
     
     print(f"Binning pipeline loaded from: {filename}")
     return pipeline_data
-
-def apply_binning_to_value(value, splits):
-    """
-    Apply binning to a single value based on split points
-    
-    Parameters:
-    - value: numerical value to bin
-    - splits: list of split points
-    
-    Returns:
-    - bin_label: string representation of the bin interval
-    """
-    if pd.isna(value):
-        return np.nan
-    
-    splits = sorted(splits)
-    
-    # Find which bin the value falls into
-    if value <= splits[0]:
-        return f"(-inf, {splits[0]}]"
-    
-    for i in range(len(splits) - 1):
-        if splits[i] < value <= splits[i + 1]:
-            return f"({splits[i]}, {splits[i + 1]}]"
-    
-    return f"({splits[-1]}, inf)"
 
 def apply_binning_pipeline(df_new, pipeline_data, 
                           features_to_discretize=None):
@@ -219,46 +223,46 @@ def apply_binning_pipeline(df_new, pipeline_data,
 def full_training_pipeline(train_values_path, train_labels_path,
                           output_csv='cat_preprocessed_train.csv',
                           output_pipeline='binning_pipeline.json',
-                          solver='cp',
-                          prebinning_method='cart'):
+                          max_bins=MAX_BINS,
+                          min_samples_leaf=MIN_SAMPLES_LEAF):
     """
     Complete pipeline for training: load, bin, and save
     
     Returns:
     - df_transformed: transformed training data
-    - binning_pipeline: the fitted binning objects
+    - binning_pipeline: the split points for each feature
     """
     # Load and merge data
     print("Loading training data...")
     df = load_and_merge_data(train_values_path, train_labels_path)
     print(f"Loaded {len(df)} samples with {len(df.columns)} columns\n")
     
-    # Define features to discretize (exclude building_id and keep geo_level_*_id as categorical)
+    # Define features to discretize
     features_to_discretize = [
-            'age', 
-            'area_percentage', 
-            'height_percentage', 
-            'geo_level_1_id', 
-            'geo_level_2_id', 
-            'geo_level_3_id',
-            'count_florrs_pre_eq',
-            'area_percentage',
-            'count_families'
-      ]
+        'age', 
+        'area_percentage', 
+        'height_percentage', 
+        'geo_level_1_id', 
+        'geo_level_2_id', 
+        'geo_level_3_id'
+    ]
 
     # Create binning pipeline
     binning_pipeline, df_transformed = create_binning_pipeline(
         df,
         prediction_col='damage_grade',
         features_to_discretize=features_to_discretize,
-        solver=solver,
-        prebinning_method=prebinning_method
+        max_bins=max_bins,
+        min_samples_leaf=min_samples_leaf
     )
     
+    # Remove damage_grade column before saving (we only want features, not labels)
+    df_transformed = df_transformed.drop('damage_grade', axis=1)
+    
     # Save transformed data
-    df_transformed.drop('damage_grade', axis=1)
     df_transformed.to_csv(output_csv, index=False)
     print(f"\nTransformed data saved to: {output_csv}")
+    print(f"Columns in output: {list(df_transformed.columns)}")
     
     # Save pipeline
     save_binning_pipeline(binning_pipeline, output_pipeline)
@@ -393,7 +397,7 @@ if __name__ == "__main__":
     print("="*80)
     print("Supervised Binning for CatBoost - Training Pipeline")
     print("="*80)
-    print("\nNote: Requires 'pip install optbinning'\n")
+    print("\nUsing Decision Tree-based binning (no external dependencies)\n")
     
     # TRAINING PHASE
     print("\n" + "="*80)
@@ -405,11 +409,11 @@ if __name__ == "__main__":
         train_labels_path='train_labels.csv',
         output_csv='cat_preprocessed_train.csv',
         output_pipeline='binning_pipeline.json',
-        solver='cp',  # or 'mip'
-        prebinning_method='cart'  # or 'quantile' or 'uniform'
+        max_bins=MAX_BINS,  # Maximum number of bins per feature
+        min_samples_leaf=MIN_SAMPLES_LEAF  # Minimum samples per bin
     )
     
-    # TEST PHASE (if you have test data)
+    # TEST PHASE
     print("\n" + "="*80)
     print("PHASE 2: TESTING - Apply binning to new data")
     print("="*80 + "\n")
